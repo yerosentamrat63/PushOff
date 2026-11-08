@@ -1,0 +1,40 @@
+# Build outputs
+build/
+**/build/
+.dart_tool/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Generated platform files
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/.last_build_id
+**/ios/Pods/
+**/ios/.symlinks/
+**/android/.gradle/
+**/android/local.properties
+**/android/gradlew
+**/android/gradlew.bat
+**/android/**/gradle-wrapper.jar
+**/android/**/GeneratedPluginRegistrant.java
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+*.keystore
+*.jks
+key.properties
+google-services.json
+GoogleService-Info.plist
+
+# Large local design reference (kept on disk, not in the repo)
+Push-Up Off App Screens.html

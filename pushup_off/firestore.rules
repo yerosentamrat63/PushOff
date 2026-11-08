@@ -1,0 +1,189 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isGroupMember(groupId) {
+      return isAuthenticated()
+        && request.auth.uid in get(
+          /databases/$(database)/documents/groups/$(groupId)
+        ).data.memberIds;
+    }
+
+    // Max 90 reps per minute (1.5 reps/sec is the human cadence ceiling).
+    function passesAntiCheatCadence(data) {
+      return data.durationSeconds is int
+        && data.durationSeconds >= 5
+        && data.durationSeconds <= 7200
+        && data.validReps is int
+        && data.validReps >= 0
+        && data.validReps <= 250
+        && (data.validReps / (data.durationSeconds / 60.0)) <= 90.0;
+    }
+
+    // ---------------------------------------------------------------------
+    // User profiles
+    // ---------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isOwner(userId)
+        && request.resource.data.totalValidReps is int
+        && request.resource.data.totalValidReps >= 0
+        && request.resource.data.totalValidReps <= 250;
+
+      // Lifetime totals may only move forward, and only by one server-validated
+      // session's worth of reps. Other profile fields are free-form.
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'totalValidReps', 'displayName', 'photoUrl', 'updatedAt'
+        ])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['totalValidReps'])
+          || (
+            request.resource.data.totalValidReps is int
+            && request.resource.data.totalValidReps >= resource.data.get('totalValidReps', 0)
+            && request.resource.data.totalValidReps - resource.data.get('totalValidReps', 0) <= 250
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Completed workout sessions
+    // Uploads counts only - never video. Immutable once written.
+    // ---------------------------------------------------------------------
+    match /sessions/{sessionId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated()
+        && request.resource.data.id == sessionId
+        && request.resource.data.userId == request.auth.uid
+        && passesAntiCheatCadence(request.resource.data)
+        && request.resource.data.formScore is number
+        && request.resource.data.formScore >= 0.0
+        && request.resource.data.formScore <= 100.0
+        && request.resource.data.rejectedReps is int
+        && request.resource.data.rejectedReps >= 0
+        // ServerTimestamp() resolves to request.time in rules. Requiring this
+        // stops clients from back-dating or forward-dating sessions.
+        && request.resource.data.timestamp == request.time
+        && request.resource.data.keys().hasOnly([
+          'id', 'userId', 'validReps', 'rejectedReps', 'formScore',
+          'durationSeconds', 'timestamp'
+        ]);
+
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Invite codes
+    // Codes are looked up by exact document id (get), never listed, so a user
+    // must already know the code to discover the group it belongs to.
+    // ---------------------------------------------------------------------
+    match /inviteCodes/{code} {
+      allow get: if isAuthenticated();
+      allow list: if false;
+
+      allow create: if isAuthenticated()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.groupId is string
+        && get(
+          /databases/$(database)/documents/groups/$(request.resource.data.groupId)
+        ).data.createdBy == request.auth.uid
+        && get(
+          /databases/$(database)/documents/groups/$(request.resource.data.groupId)
+        ).data.inviteCode == code;
+
+      allow update: if false;
+
+      allow delete: if isAuthenticated()
+        && resource.data.ownerId == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------------
+    // Group challenges
+    // ---------------------------------------------------------------------
+    match /groups/{groupId} {
+      // Only members may read a group (invite codes are no longer public).
+      allow read: if isAuthenticated()
+        && request.auth.uid in resource.data.memberIds;
+
+      allow create: if isAuthenticated()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.memberIds == [request.auth.uid]
+        && request.resource.data.totalRepsInPeriod == 0
+        && request.resource.data.inviteCode is string
+        && request.resource.data.inviteCode.size() >= 8
+        && request.resource.data.inviteCode.size() <= 16
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.goal is int
+        && request.resource.data.goal > 0;
+
+      allow update: if isAuthenticated()
+        && (
+          // 1. Creator edits group metadata. Identity fields are immutable.
+          (
+            resource.data.createdBy == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'name', 'goal', 'period', 'startsAt', 'endsAt'
+            ])
+          )
+          // 2. Creator or member increments the shared rep tally, bounded to a
+          //    single session's maximum.
+          || (
+            request.auth.uid in resource.data.memberIds
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['totalRepsInPeriod'])
+            && request.resource.data.totalRepsInPeriod is int
+            && request.resource.data.totalRepsInPeriod >= resource.data.totalRepsInPeriod
+            && request.resource.data.totalRepsInPeriod - resource.data.totalRepsInPeriod <= 250
+          )
+          // 3. Joining: a non-member may only append themselves, and only when
+          //    they present the group's real invite code. Existing membership
+          //    is preserved, so nobody can be removed by a joiner.
+          || (
+            !(request.auth.uid in resource.data.memberIds)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds'])
+            && request.resource.data.memberIds.hasAll(resource.data.memberIds)
+            && request.resource.data.memberIds.size() == resource.data.memberIds.size() + 1
+            && request.auth.uid in request.resource.data.memberIds
+            && get(
+              /databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)
+            ).data.groupId == groupId
+          )
+          // 4. Idempotent re-join: members may re-send the same member list.
+          || (
+            request.auth.uid in resource.data.memberIds
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds'])
+            && request.resource.data.memberIds == resource.data.memberIds
+          )
+        );
+
+      allow delete: if isAuthenticated()
+        && resource.data.createdBy == request.auth.uid;
+
+      // -------------------------------------------------------------------
+      // Group members subcollection
+      // -------------------------------------------------------------------
+      match /members/{memberId} {
+        allow read: if isGroupMember(groupId);
+
+        allow write: if isAuthenticated()
+          && request.auth.uid == memberId
+          && isGroupMember(groupId);
+      }
+    }
+  }
+}
